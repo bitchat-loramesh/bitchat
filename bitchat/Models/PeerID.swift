@@ -22,6 +22,8 @@ struct PeerID: Equatable, Hashable {
         case geoDM = "nostr_"
         /// `"nostr:"` (+ 8 characters hex)
         case geoChat = "nostr:"
+        /// `"mtt:"` not included in the prefix
+        case meshtastic = "mtt:"
     }
     
     let prefix: Prefix

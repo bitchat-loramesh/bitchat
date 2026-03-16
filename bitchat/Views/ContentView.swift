@@ -52,6 +52,7 @@ struct ContentView: View {
     @State private var scrollThrottleTimer: Timer?
     @State private var autocompleteDebounceTimer: Timer?
     @State private var showLocationChannelsSheet = false
+    @State private var showMeshtasticSheet = false // Displays the meshtastic radio sheet ?
     @State private var showVerifySheet = false
     @State private var expandedMessageIDs: Set<String> = []
     @State private var showLocationNotes = false
@@ -1337,6 +1338,19 @@ struct ContentView: View {
                 .padding(.leading, 4)
                 .padding(.trailing, 2)
 
+                // Meshtastic button 'MTT'
+                Button(action: { showMeshtasticSheet = true }) {
+                    Text("MTT")
+                        .font(.bitchatSystem(size: 14, design: .monospaced))
+                        .foregroundColor(Color.orange)
+                        .lineLimit(headerLineLimit)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .accessibilityLabel("Meshtastic Radio Management")
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 2)
+                .padding(.trailing, 2)
+
                 HStack(spacing: 4) {
                     // People icon with count
                     Image(systemName: "person.2.fill")
@@ -1377,6 +1391,10 @@ struct ContentView: View {
                 .environmentObject(viewModel)
                 .onAppear { viewModel.isLocationChannelsSheetPresented = true }
                 .onDisappear { viewModel.isLocationChannelsSheetPresented = false }
+        }
+        .sheet(isPresented: $showMeshtasticSheet) {
+            MeshtasticManagementView(isPresented: $showMeshtasticSheet)
+                .environmentObject(viewModel)
         }
         .sheet(isPresented: $showLocationNotes, onDismiss: {
             notesGeohash = nil

@@ -140,4 +140,14 @@ struct NotificationStreamAssembler {
 
         return (frames, dropped, didReset)
     }
+    
+    mutating func basicAppend(_ chunk: Data) -> (frames: [Data], droppedPrefixes: [UInt8], reset: Bool) {
+        // Basic mode: no validation, just accumulate and emit as a single frame.
+        guard !chunk.isEmpty else { return ([], [], false) }
+        buffer.append(chunk)
+        let frame = buffer
+        buffer.removeAll(keepingCapacity: false)
+        return ([frame], [], false)
+    }
+
 }
