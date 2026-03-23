@@ -22,6 +22,9 @@ struct MeshtasticManagementView: View {
     /// Current color scheme (light or dark mode)
     @Environment(\.colorScheme) var colorScheme
     
+    /// State to force view refresh
+    @State private var refreshID = UUID()
+    
     // MARK: - Computed Properties
     
     /// Background color based on current theme
@@ -59,6 +62,7 @@ struct MeshtasticManagementView: View {
                     
                     // Discovered devices section
                     discoveredDevicesSection
+                        .id(refreshID) // Force refresh when ID changes
                     
                     Spacer()
                 }
@@ -71,6 +75,22 @@ struct MeshtasticManagementView: View {
         #if os(macOS)
         .frame(minWidth: 450, minHeight: 500)
         #endif
+        .onReceive(viewModel.objectWillChange) { _ in
+            // Refresh the view when viewModel changes
+            refreshID = UUID()
+        }
+        .onAppear {
+            // Set up a timer to periodically refresh on macOS
+            #if os(macOS)
+            Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
+                if !isPresented {
+                    timer.invalidate()
+                } else {
+                    refreshID = UUID()
+                }
+            }
+            #endif
+        }
     }
     
     // MARK: - View Components
@@ -135,48 +155,89 @@ struct MeshtasticManagementView: View {
             
             if viewModel.meshService is BLEService {
                 let bleService = viewModel.meshService as! BLEService
-                if bleService.getMeshtasticDevice().isEmpty {
+                // Force re-evaluation by accessing viewModel's published objectWillChange
+                let _ = viewModel.objectWillChange
+                let devices = bleService.getMeshtasticDevice()
+                
+                if devices.isEmpty {
                     Text("No Meshtastic devices found")
                         .font(.bitchatSystem(size: 12, design: .monospaced))
                         .foregroundColor(secondaryTextColor)
                         .padding(.top, 8)
                 } else {
-                    List(bleService.getMeshtasticDevice(), id: \.1.identifier) { device in
-                        Button(action: {
-                            if !device.connected {
-                                bleService.connectToMeshtastic(peripheral: device.1, service: device.0)
-                            } else {
-                                bleService.disconnectFromMeshtastic(peripheral: device.1)
+                    #if os(macOS)
+                    // Use ForEach instead of List for macOS to avoid rendering issues
+                    ScrollView {
+                        VStack(spacing: 8) {
+                            ForEach(devices, id: \.1.identifier) { device in
+                                deviceRow(device: device, bleService: bleService)
                             }
-                        }) {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Circle()
-                                        .fill(device.2 ? Color.green : Color.red)
-                                        .frame(width: 8, height: 8)
-                                    Text(device.1.name ?? "Unknown Device")
-                                        .font(.bitchatSystem(size: 13, weight: .medium, design: .monospaced))
-                                        .foregroundColor(textColor)
-                                    
-                                    Text(device.1.identifier.uuidString)
-                                        .font(.bitchatSystem(size: 11, design: .monospaced))
-                                        .foregroundColor(secondaryTextColor)
-                                }
-                                
-                                Spacer()
-                                
-                                Image(systemName: "chevron.right")
-                                    .font(.bitchatSystem(size: 12, design: .monospaced))
-                                    .foregroundColor(secondaryTextColor)
-                            }
-                            .padding(.vertical, 4)
                         }
-                        .buttonStyle(.plain)
+                        .padding(.vertical, 4)
                     }
                     .frame(minHeight: 200)
+                    #else
+                    List(devices, id: \.1.identifier) { device in
+                        deviceRow(device: device, bleService: bleService)
+                    }
+                    .frame(minHeight: 200)
+                    #endif
                 }
             }
         }
+    }
+    
+    /// Single device row for cleaner code
+    @ViewBuilder
+    private func deviceRow(device: (CBService, CBPeripheral, Bool), bleService: BLEService) -> some View {
+        Button(action: {
+            if !device.2 {
+                bleService.connectToMeshtastic(peripheral: device.1, service: device.0)
+            } else {
+                bleService.disconnectFromMeshtastic(peripheral: device.1)
+            }
+            // Force UI update after connection state change
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                viewModel.objectWillChange.send()
+            }
+        }) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(device.2 ? Color.green : Color.red)
+                            .frame(width: 8, height: 8)
+                        
+                        Text(device.2 ? "Connected" : "Disconnected")
+                            .font(.bitchatSystem(size: 11, design: .monospaced))
+                            .foregroundColor(device.2 ? Color.green : secondaryTextColor)
+                    }
+                    
+                    Text(device.1.name ?? "Unknown Device")
+                        .font(.bitchatSystem(size: 13, weight: .medium, design: .monospaced))
+                        .foregroundColor(textColor)
+                    
+                    Text(device.1.identifier.uuidString)
+                        .font(.bitchatSystem(size: 11, design: .monospaced))
+                        .foregroundColor(secondaryTextColor)
+                }
+                
+                Spacer()
+                
+                Image(systemName: device.2 ? "checkmark.circle.fill" : "chevron.right")
+                    .font(.bitchatSystem(size: 12, design: .monospaced))
+                    .foregroundColor(device.2 ? Color.green : secondaryTextColor)
+            }
+            .padding(.vertical, 4)
+            #if os(macOS)
+            .padding(.horizontal, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(backgroundColor.opacity(0.3))
+            )
+            #endif
+        }
+        .buttonStyle(.plain)
     }
     
     // MARK: - Helper Methods

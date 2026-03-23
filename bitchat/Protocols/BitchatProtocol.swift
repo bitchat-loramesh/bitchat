@@ -81,6 +81,10 @@ enum MessageType: UInt8 {
     case fragment = 0x20        // Single fragment type for large messages
     case fileTransfer = 0x22    // Binary file/audio/image payloads
     
+    // Meshtastic related packet types
+    case mttHello = 0x30
+    case mttHelloBack = 0x31
+    
     var description: String {
         switch self {
         case .announce: return "announce"
@@ -91,6 +95,8 @@ enum MessageType: UInt8 {
         case .noiseEncrypted: return "noiseEncrypted"
         case .fragment: return "fragment"
         case .fileTransfer: return "fileTransfer"
+        case .mttHello: return "meshtasticHello"
+        case .mttHelloBack: return "meshtasticHelloBack"
         }
     }
 }
@@ -108,6 +114,7 @@ enum NoisePayloadType: UInt8 {
     // Verification (QR-based OOB binding)
     case verifyChallenge = 0x10     // Verification challenge
     case verifyResponse  = 0x11     // Verification response
+
     
     var description: String {
         switch self {
@@ -115,7 +122,7 @@ enum NoisePayloadType: UInt8 {
         case .readReceipt: return "readReceipt"
         case .delivered: return "delivered"
         case .verifyChallenge: return "verifyChallenge"
-        case .verifyResponse: return "verifyResponse"
+        case .verifyResponse: return "verifyResponse"            
         }
     }
 }

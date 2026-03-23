@@ -4,20 +4,6 @@
 //
 //  Created by Anton Appel on 05/03/2026.
 //
-//  This file handles bidirectional conversion between BitChat messages and Meshtastic packets.
-//
-//  OUTBOUND (BitChat → Meshtastic):
-//  1. Extract message payload from BitchatPacket
-//  2. Convert to TAKPacket (ATAK format) 
-//  3. Wrap in ToRadio protobuf with ATAK_PLUGIN portnum
-//  4. Serialize and send to Meshtastic radio via BLE
-//
-//  INBOUND (Meshtastic → BitChat):
-//  1. Receive FromRadio protobuf from Meshtastic radio
-//  2. Extract TAKPacket from ATAK_PLUGIN payload
-//  3. Extract message text/data from TAKPacket
-//  4. Wrap in new BitchatPacket for local mesh
-//
 
 import BitLogger
 import Foundation
@@ -25,20 +11,22 @@ import Combine
 import CoreBluetooth
 import MeshtasticProtobufs
 import SwiftProtobuf
+import BitLogger
 
 
-final class Meshtastic: NSObject {
+extension BLEService {
     
-    // MARK: - Constants
-    
-    
+    // MARK: - Meshtastic constants
     static let meshtasticServiceCBUUID = CBUUID(string: "6BA1B218-15A8-461F-9FA8-5DCAE273EAFD")
     static let meshtasticTORADIO_UUID = CBUUID(string: "F75C76D2-129E-4DAD-A1DD-7866124401E7")
     static let meshtasticFROMRADIO_UUID = CBUUID(string: "2C55E69E-4993-11ED-B878-0242AC120002")
     static let meshtasticFROMNUM_UUID = CBUUID(string: "ED9DA18C-A800-4F66-A670-AA7547E34453")
     static let meshtasticLOGRADIO_UUID = CBUUID(string: "5a3d6e49-06e6-4423-9944-e9de8cdf9547")
     
-    // MARK: - Protobuf encoding
+    // 30 minutes before cleaning un the peer
+    static let meshtasticPeerInactivityTimeoutSeconds: Double = 1800.0
+    
+    // MARK: - Protobuf encoding && static methods
     // Convert BitChat message payload to ATAK protocol
     public static func toAttakProtocol(_ messagePayload: Data) -> TAKPacket? {
         // Build a TAKPacket from BitChat message payload.
@@ -204,11 +192,609 @@ final class Meshtastic: NSObject {
 
         // Fallback: If for some reason the ToRadio directly embeds TAK bytes (unlikely),
         // reuse the Data-based checker. This will be false for normal ToRadio envelopes.
-        if let bin = try? radioData.serializedData(), Meshtastic.isAtak(bin) {
+        if let bin = try? radioData.serializedData(), BLEService.isAtak(bin) {
             return true
         }
 
         return false
     }
+    
+    
+    // MARK: - BLE Methods
+    public func connectToMeshtastic(peripheral: CBPeripheral, service: CBService) {
+        // pair the device
+        peripheral.delegate = self
+        SecureLogger.debug("✨ Connecting to a Meshtastic Radio")
+        
+        guard let characteristics = service.characteristics else { return }
+        
+        var foundToRadio: CBCharacteristic?
+        var foundFromRadio: CBCharacteristic?
+        var foundFromNum: CBCharacteristic?
+        let peripheralID = peripheral.identifier.uuidString
+    
+        
+        for characteristic in characteristics {
+            let props = characteristic.properties
+            SecureLogger.debug("🔍 Props from \(characteristic.uuid): \(props.rawValue)")
+
+            switch characteristic.uuid {
+            case BLEService.meshtasticTORADIO_UUID:
+                foundToRadio = characteristic
+                SecureLogger.debug("✅ Found TORADIO")
+
+            case BLEService.meshtasticFROMRADIO_UUID:
+                foundFromRadio = characteristic
+                SecureLogger.debug("✅ Found FROMRADIO")
+                
+            case BLEService.meshtasticFROMNUM_UUID:
+                foundFromNum = characteristic
+                SecureLogger.debug("✅ Found FROMNUM")
+                
+            default:
+                break
+            }
+        }
+        
+        guard let toRadio = foundToRadio, let fromRadio = foundFromRadio else {
+            SecureLogger.error("❌ Missing mandatory characteristics")
+            return
+        }
+        
+        if var state = self.peripherals[peripheralID] {
+            state.toRadioCharacteristic = toRadio
+            state.fromRadioCharacteristic = fromRadio
+            state.isConnected = true
+            self.peripherals[peripheralID] = state
+        } else {
+            // Create new peripheral state if it doesn't exist
+            let newState = BLEService.PeripheralState(
+                peripheral: peripheral,
+                characteristic: nil,
+                peerID: nil,
+                isConnecting: false,
+                isConnected: true,
+                lastConnectionAttempt: nil,
+                assembler: NotificationStreamAssembler(),
+                toRadioCharacteristic: toRadio,
+                fromRadioCharacteristic: fromRadio
+            )
+            self.peripherals[peripheralID] = newState
+        }
+        
+        
+        // Notify UI immediately
+        notifyUI {
+            // Set the mtt device to connected
+            if let index = self.meshtasticServices.firstIndex(where: { $0.peripheral.identifier == peripheral.identifier}) {
+                self.meshtasticServices[index].connected = true
+            }
+        }
+
+        SecureLogger.debug("✅ Stored Meshtastic characteristics for \(peripheral.name ?? "Unknown")", category: .session)
+        
+        // Meshtastic Handshake to connect to the radio
+        let configId = UInt32.random(in: 1...UInt32.max)
+        var toRadioPacket = ToRadio()
+        toRadioPacket.wantConfigID = configId
+        if let data = try? toRadioPacket.serializedData() {
+            peripheral.writeValue(data, for: toRadio, type: .withResponse)
+            SecureLogger.debug("📤 Sent want_config_id: \(configId)")
+        }
+        peripheral.readValue(for: fromRadio)
+    
+        // We can the finnaly subscribe to from num
+        if let fromNum = foundFromNum {
+            self.messageQueue.asyncAfter(deadline: .now() + 0.5) {
+                peripheral.setNotifyValue(true, for: fromNum)
+                SecureLogger.debug("🔔 Subscribed to FROMNUM")
+            }
+        }
+        self.messageQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.sendAnnounce(forceSend: true)
+            self?.flushDirectedSpool()
+        }
+        SecureLogger.info("✨ Meshtastic Handshake Complete for \(peripheral.name ?? "Unknown"), sending hellos", category: .session)
+        
+        sendLazyMttDiscovery(peripheral: peripheral, service: service)
+    }
+    
+    private func getMyPeerInfo() -> PeerInfo {
+        // Get our nickname
+        let myNickname = self.myNickname
+        
+        return PeerInfo(
+            peerID: self.myPeerID,
+            nickname: myNickname,
+            isConnected: true,
+            noisePublicKey: nil,
+            signingPublicKey: nil,
+            isVerifiedNickname: true,  // We trust our own nickname
+            lastSeen: Date(),
+        )
+    }
+
+    public func handleMeshtasticPacket(chunk: Data, peripheral: CBPeripheral, state: PeripheralState) {
+        // This is data from a Meshtastic radio
+        SecureLogger.info("📡 Received \(chunk.count) bytes from Meshtastic radio: \(state.peripheral.name ?? "unknown")")
+        
+        // Try to extract the message payload from the Meshtastic FromRadio envelope
+        if let messageData = BLEService.toBitchat(chunk) {
+            SecureLogger.info("📡 Extracted \(messageData.count) bytes from Meshtastic packet")
+            if let originalPacket = BinaryProtocol.decode(messageData) {
+                switch MessageType(rawValue: originalPacket.type) {
+                case .mttHello:
+                    handleReceiveHello(packet: originalPacket, peripheral: peripheral, state: state)
+                    return
+                case .mttHelloBack:
+                    handleReceiveHelloBack(packet: originalPacket, peripheral: peripheral)
+                    return
+                default:
+                    break
+                }
+                
+                processNotificationPacket(originalPacket, from: peripheral, peripheralUUID: peripheral.identifier.uuidString)
+            } else {
+                SecureLogger.error("❌ Could not process packet from Meshtastic")
+            }
+        } else {
+            SecureLogger.warning("📡 Could not extract message from Meshtastic data", category: .session)
+        }
+    }
+    
+    public func getDataFromMeshtastic(peripheral: CBPeripheral, characteristic: CBCharacteristic) {
+        guard let data = characteristic.value, !data.isEmpty else {
+            return
+        }
+        
+        // Parser le FromRadio protobuf
+        do {
+            let fromRadio = try FromRadio(serializedBytes: data)
+            
+            switch fromRadio.payloadVariant {
+                
+            case .packet(let meshPacket):
+                // C'est un vrai packet mesh
+                switch meshPacket.payloadVariant {
+                    
+                case .decoded(let decoded):
+                    switch decoded.portnum {
+                        
+                    case .atakPlugin:
+                        SecureLogger.info("🎯 ATAK packet received — \(decoded.payload.count) bytes")
+                        bufferNotificationChunk(data, from: peripheral)
+                        
+                    case .textMessageApp:
+                        SecureLogger.info("💬 Text message Meshtastic")
+                        
+                    case .positionApp:
+                        SecureLogger.debug("📍 Position packet — ignoré")
+                        
+                    default:
+                        SecureLogger.debug("📦 Portnum ignoré: \(decoded.portnum)")
+                    }
+                    
+                case .encrypted:
+                    // Packet chiffré non décodable (pas notre channel)
+                    SecureLogger.debug("🔒 Encrypted packet — ignoré")
+                    
+                default:
+                    break
+                }
+                
+            case .myInfo(let info):
+                SecureLogger.info("ℹ️ MyInfo reçu: nodeNum=\(info.myNodeNum)")
+                
+            case .nodeInfo(let node):
+                SecureLogger.debug("👤 NodeInfo: \(node.user.longName)")
+                
+            default:
+                SecureLogger.debug("📨 FromRadio payload ignoré: \(fromRadio.payloadVariant, default: "#ignored")")
+            }
+            
+        } catch {
+            SecureLogger.error("❌ Protobuf parse error: \(error)")
+        }
+    }
+    
+    
+    // MARK: -- Meshtastic Hello and HelloBack
+    
+    public func sendLazyMttDiscovery(peripheral: CBPeripheral, service: CBService) {
+        // Sends the meshtastic handshake for discovery and announcing oursevles
+        // Here, just first phase
+        // Protocol
+        // 1. Us -> {.mttHello, bc,   [meshtasticRadioName, MyPeerInfo, other peers info]}
+        // 2. Other <- {.mttHelloBack, myPeerID,   [meshtasticRadioName, TheirPeerInfo, other peers info]}
+        
+        var packetData = Data()
+        let peripheralID = peripheral.identifier.uuidString
+        guard let state = self.peripherals[peripheralID] else {
+            SecureLogger.error("❌ Cannot find peripheral ID \(peripheralID)")
+            return
+        }
+        
+        guard let toRadio = state.toRadioCharacteristic else {
+            SecureLogger.error("❌ Cannot find toRadio characteristic for \(peripheralID)")
+            return
+        }
+        
+        let helloID = UInt16.random(in: 0..<(2^16-1)).bigEndian
+        packetData.append(contentsOf: withUnsafeBytes(of: helloID) { Array($0) })
+        
+        // Add meshtasticRadioName (length-prefixed string)
+        let radioName = peripheral.name ?? "Unknown"
+        appendLengthPrefixed(string: radioName, to: &packetData)
+        
+        // Count + 1 because we add our information at the beggining of the peer list
+        let count = UInt16(peers.count + 1).bigEndian
+        packetData.append(contentsOf: withUnsafeBytes(of: count) { Array($0) })
+        
+        packetData.append(serializePeer(getMyPeerInfo()))
+        for (_, peer) in self.peers {
+            packetData.append(serializePeer(peer))
+        }
+        
+        // Create BitchatPacket with type .mttHello
+        let bitchatPacket = BitchatPacket(
+            type: MessageType.mttHello.rawValue,
+            ttl: 7,
+            senderID: self.myPeerID,
+            payload: packetData,
+            isRSR: false
+        )
+        
+        guard let bitchatData = bitchatPacket.toBinaryData(padding: false) else {
+            SecureLogger.error("❌ Failed to encode BitchatPacket for mttHello")
+            return
+        }
+        
+        // Convert BitchatPacket to Meshtastic ToRadio format
+        let meshtasticData = BLEService.toMeshtasticData(bitchatData)
+        
+        guard !meshtasticData.isEmpty else {
+            SecureLogger.error("❌ Cannot serialize data for meshtastic Hello packet")
+            return
+        }
+        
+        SecureLogger.debug("📤 Sending mttHello packet (\(bitchatData.count) bytes payload) via Meshtastic (radio: \(radioName))", category: .session)
+        peripheral.writeValue(meshtasticData, for: toRadio, type: .withResponse)
+    }
+    
+    
+    public func sendHelloBack(peripheral: CBPeripheral, characteristic: CBCharacteristic, helloId: UInt16) {
+        var packetData = Data()
+        
+        packetData.append(contentsOf: withUnsafeBytes(of: helloId) { Array($0) })
+        
+        // Add meshtasticRadioName (length-prefixed string)
+        let radioName = peripheral.name ?? "Unknown"
+        appendLengthPrefixed(string: radioName, to: &packetData)
+        
+        // Count + 1 because we add our information at the beggining of the peer list
+        let count = UInt16(peers.count + 1).bigEndian
+        packetData.append(contentsOf: withUnsafeBytes(of: count) { Array($0) })
+        
+        packetData.append(serializePeer(getMyPeerInfo()))
+        for (_, peer) in self.peers {
+            packetData.append(serializePeer(peer))
+        }
+        
+        // Create BitchatPacket with type .mttHelloBack
+        let bitchatPacket = BitchatPacket(
+            type: MessageType.mttHelloBack.rawValue,
+            ttl: 7,
+            senderID: self.myPeerID,
+            payload: packetData,
+            isRSR: false,
+        )
+        
+        guard let bitchatData = bitchatPacket.toBinaryData(padding: false) else {
+            SecureLogger.error("❌ Failed to encode BitchatPacket for mttHelloBack")
+            return
+        }
+        
+        // Convert BitchatPacket to Meshtastic ToRadio format
+        let meshtasticData = BLEService.toMeshtasticData(bitchatData)
+        
+        guard !meshtasticData.isEmpty else {
+            SecureLogger.error("❌ Cannot serialize data for meshtastic HelloBack packet")
+            return
+        }
+        
+        SecureLogger.debug("📤 Sending mttHelloBack packet (\(bitchatData.count) bytes payload) via Meshtastic (radio: \(radioName))", category: .session)
+        peripheral.writeValue(meshtasticData, for: characteristic, type: .withResponse)
+    }
+    
+    
+    public func handleReceiveHello(packet: BitchatPacket, peripheral: CBPeripheral, state: PeripheralState) {
+        guard let toRadio = state.toRadioCharacteristic else {
+            SecureLogger.error("❌ Cannot get to radio characteristic")
+            return
+        }
+        
+        let packetContent = try? deserializePeers(from: packet.payload)
+        
+        if let radioName = packetContent?.meshtasticRadioName {
+            SecureLogger.info("📡 Received Hello from Meshtastic radio: \(radioName)", category: .session)
+        }
+        
+        // Acknowledge the sender and all the peers contained in the list of peers
+        notifyUI {
+            var updatedPeers = self.peers
+            var updatedMapping = self.peerToPeripheralUUID
+            
+            for (peerID, peerInfo) in packetContent?.peers ?? [:] {
+                if updatedPeers.contains(where: { $0.key == peerID }) {
+                    let oldPeerInfo = updatedPeers[peerID]!
+                    if oldPeerInfo.lastSeen < peerInfo.lastSeen {
+                        updatedPeers[peerID] = peerInfo
+                    }
+                    continue
+                }
+                SecureLogger.warning("🚨 Received unknown peer: \(peerID) aka \(peerInfo.nickname)")
+                updatedPeers[peerID] = peerInfo
+                updatedMapping[peerID] = peripheral.identifier.uuidString
+            }
+            
+            // Reassign the entire dictionary to trigger @Published
+            self.peers = updatedPeers
+            
+            // We can map peerID -> peripheral because this peripheral is directly linked
+            self.peerToPeripheralUUID = updatedMapping
+        }
+        
+        // Wait a few seconds before sending HelloBack to avoid network congestion
+        self.messageQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.sendHelloBack(peripheral: peripheral, characteristic: toRadio, helloId: packetContent?.helloId ?? 0)
+        }
+        
+        sendOnAllLinks(packet: packet, data: packet.toBinaryData() ?? Data(), pad: false, directedOnlyPeer: nil as PeerID?)
+    }
+    
+    public func handleReceiveHelloBack(packet: BitchatPacket, peripheral: CBPeripheral) {
+        // Acknowledge the sender and all the peers contained in the list of peers
+        let packetContent = try? deserializePeers(from: packet.payload)
+        
+        SecureLogger.info("👋 Received HelloBack n°\(packetContent?.helloId ?? 0) from radio: \(packetContent?.meshtasticRadioName ?? "Unknown")")
+        
+        notifyUI {
+            var updatedPeers = self.peers
+            var updatedMapping = self.peerToPeripheralUUID
+            
+            for (peerID, peerInfo) in packetContent?.peers ?? [:] {
+                if updatedPeers.contains(where: { $0.key == peerID }) {
+                    let oldPeerInfo = updatedPeers[peerID]!
+                    if oldPeerInfo.lastSeen < peerInfo.lastSeen {
+                        updatedPeers[peerID] = peerInfo
+                    }
+                    continue
+                }
+                SecureLogger.warning("🚨 Received unknown peer: \(peerID) aka \(peerInfo.nickname)")
+                updatedPeers[peerID] = peerInfo
+                
+                // We can map peerID -> peripheral because this peripheral is directly linked
+                updatedMapping[peerID] = peripheral.identifier.uuidString
+            }
+            
+            // Reassign the entire dictionary to trigger @Published
+            self.peers = updatedPeers
+            self.peerToPeripheralUUID = updatedMapping
+        }
+        sendOnAllLinks(packet: packet, data: packet.toBinaryData() ?? Data(), pad: false, directedOnlyPeer: nil as PeerID?)
+    }
+    
+    // MARK: -- Bitchat-side meshtastic packets
+    
+    public func handleHelloBitchat(_ packet: BitchatPacket, from: PeerID) {
+        let packetContent = try? deserializePeers(from: packet.payload)
+        
+        if let radioName = packetContent?.meshtasticRadioName {
+            SecureLogger.info("📡 Received Hello from Bitchat peer via radio: \(radioName)", category: .session)
+        }
+        
+        // Acknowledge the sender and all the peers contained in the list of peers
+        notifyUI {
+            var updatedPeers = self.peers
+            
+            for (peerID, peerInfo) in packetContent?.peers ?? [:] {
+                if updatedPeers.contains(where: { $0.key == peerID }) {
+                    let oldPeerInfo = updatedPeers[peerID]!
+                    if oldPeerInfo.lastSeen < peerInfo.lastSeen {
+                        updatedPeers[peerID] = peerInfo
+                    }
+                    continue
+                }
+                SecureLogger.warning("🚨 Received unknown peer: \(peerID) aka \(peerInfo.nickname)")
+                updatedPeers[peerID] = peerInfo
+            }
+            
+            // Reassign the entire dictionary to trigger @Published
+            self.peers = updatedPeers
+        }
+    }
+    
+    public func handleHelloBackBitchat(_ packet: BitchatPacket, from: PeerID) {
+        let packetContent = try? deserializePeers(from: packet.payload)
+        
+        if let radioName = packetContent?.meshtasticRadioName {
+            SecureLogger.info("👋 Received HelloBack from Bitchat peer via radio: \(radioName)", category: .session)
+        }
+        
+        // Acknowledge the sender and all the peers contained in the list of peers
+        notifyUI {
+            var updatedPeers = self.peers
+            
+            for (peerID, peerInfo) in packetContent?.peers ?? [:] {
+                if updatedPeers.contains(where: { $0.key == peerID }) {
+                    let oldPeerInfo = updatedPeers[peerID]!
+                    if oldPeerInfo.lastSeen < peerInfo.lastSeen {
+                        updatedPeers[peerID] = peerInfo
+                    }
+                    continue
+                }
+                SecureLogger.warning("🚨 Received unknown peer: \(peerID) aka \(peerInfo.nickname)")
+                updatedPeers[peerID] = peerInfo
+            }
+            
+            // Reassign the entire dictionary to trigger @Published
+            self.peers = updatedPeers
+        }
+    }
 }
 
+
+// MARK: -- Peer serialization --
+/// In order to send the Hello and HelloBack messages for meshtastic,
+/// Peers needs to be serialized in a list to be sent
+///
+/// Format:
+///  ------------------------------------------------------------------------------------
+/// | Hello ID | Radio Name   | Peer Count | Peer ID      | Nickname     | Flags  |  noiseKey         | singningKey         | LastSeen  |   x N peers
+/// | 2B       | 2B len + N   | 2B         | 2B len + N   | 2B len + N   | 1 byte | 1B pres + 32B     | 1B pres + 32B       | 8B Uint64 |
+///  ------------------------------------------------------------------------------------
+///
+///  Flags byte :
+///     0 : is connected
+///     1 : is verified nickname
+///     2-7 : reserved
+///
+
+extension BLEService {
+    private func serializePeer(_ peer: PeerInfo) -> Data {
+        var data = Data()
+
+        // peerID (String → UTF-8, préfixé par 2 bytes de longueur)
+        appendLengthPrefixed(string: peer.peerID.id, to: &data)
+
+        // nickname
+        appendLengthPrefixed(string: peer.nickname, to: &data)
+
+        // flags byte : bit0 = isConnected, bit1 = isVerifiedNickname
+        var flags: UInt8 = 0
+        if peer.isConnected        { flags |= 0x01 }
+        if peer.isVerifiedNickname { flags |= 0x02 }
+        data.append(flags)
+
+        // noisePublicKey (presence byte + 32 bytes si présente)
+        appendOptionalKey(peer.noisePublicKey, to: &data)
+
+        // signingPublicKey
+        appendOptionalKey(peer.signingPublicKey, to: &data)
+
+        // lastSeen — UInt64 Unix timestamp (milliseconds), big-endian
+        let ts = UInt64(peer.lastSeen.timeIntervalSince1970 * 1000).bigEndian
+        data.append(contentsOf: withUnsafeBytes(of: ts) { Array($0) })
+
+        return data
+    }
+    
+    func deserializePeers(from data: Data) throws -> (helloId: UInt16, meshtasticRadioName: String, peers: [PeerID: PeerInfo]) {
+            var offset = 0
+            var result: [PeerID: PeerInfo] = [:]
+
+            let helloId = try readUInt16(from: data, offset: &offset)
+            let meshtasticRadioName = try readLengthPrefixedString(from: data, offset: &offset)
+        
+            let count = try readUInt16(from: data, offset: &offset)
+
+            for _ in 0..<count {
+                let peer = try readPeer(from: data, offset: &offset)
+                result[peer.peerID] = peer
+            }
+            return (helloId: helloId, meshtasticRadioName: meshtasticRadioName, peers: result)
+        }
+
+        private func readPeer(from data: Data, offset: inout Int) throws -> PeerInfo {
+            let peerID   = try readLengthPrefixedString(from: data, offset: &offset)
+            let nickname = try readLengthPrefixedString(from: data, offset: &offset)
+
+            let flags             = try readByte(from: data, offset: &offset)
+            let isConnected       = (flags & 0x01) != 0
+            let isVerifiedNick    = (flags & 0x02) != 0
+
+            let noiseKey   = try readOptionalKey(from: data, offset: &offset)
+            let signingKey = try readOptionalKey(from: data, offset: &offset)
+
+            let tsMillis   = try readUInt64(from: data, offset: &offset)
+            let lastSeen   = Date(timeIntervalSince1970: Double(tsMillis) / 1000.0)
+
+            return PeerInfo(
+                peerID: PeerID(str: peerID),
+                nickname: nickname,
+                isConnected: isConnected,
+                noisePublicKey: noiseKey,
+                signingPublicKey: signingKey,
+                isVerifiedNickname: isVerifiedNick,
+                lastSeen: lastSeen
+            )
+        }
+    
+    // MARK: - Helpers write
+
+        private func appendLengthPrefixed(string: String, to data: inout Data) {
+            let bytes = Array(string.utf8)
+            let len = UInt16(bytes.count).bigEndian
+            data.append(contentsOf: withUnsafeBytes(of: len) { Array($0) })
+            data.append(contentsOf: bytes)
+        }
+
+        private func appendOptionalKey(_ key: Data?, to data: inout Data) {
+            if let key {
+                data.append(0x01)
+                data.append(key)
+            } else {
+                data.append(0x00)
+            }
+        }
+
+        // MARK: - Helpers read
+
+        enum SerializationError: Error {
+            case unexpectedEndOfData
+            case invalidStringEncoding
+        }
+
+        private func readByte(from data: Data, offset: inout Int) throws -> UInt8 {
+            guard offset < data.count else { throw SerializationError.unexpectedEndOfData }
+            defer { offset += 1 }
+            return data[offset]
+        }
+
+        private func readUInt16(from data: Data, offset: inout Int) throws -> UInt16 {
+            guard offset + 2 <= data.count else { throw SerializationError.unexpectedEndOfData }
+            // Safe byte-by-byte construction to avoid alignment issues
+            let value = UInt16(data[offset]) << 8 | UInt16(data[offset + 1])
+            offset += 2
+            return value
+        }
+
+        private func readUInt64(from data: Data, offset: inout Int) throws -> UInt64 {
+            guard offset + 8 <= data.count else { throw SerializationError.unexpectedEndOfData }
+            // Safe byte-by-byte construction to avoid alignment issues
+            var value: UInt64 = 0
+            for i in 0..<8 {
+                value = (value << 8) | UInt64(data[offset + i])
+            }
+            offset += 8
+            return value
+        }
+
+        private func readLengthPrefixedString(from data: Data, offset: inout Int) throws -> String {
+            let len = Int(try readUInt16(from: data, offset: &offset))
+            guard offset + len <= data.count else { throw SerializationError.unexpectedEndOfData }
+            guard let str = String(bytes: data[offset..<offset+len], encoding: .utf8) else {
+                throw SerializationError.invalidStringEncoding
+            }
+            offset += len
+            return str
+        }
+
+        private func readOptionalKey(from data: Data, offset: inout Int) throws -> Data? {
+            let presence = try readByte(from: data, offset: &offset)
+            guard presence == 0x01 else { return nil }
+            guard offset + 32 <= data.count else { throw SerializationError.unexpectedEndOfData }
+            defer { offset += 32 }
+            return data[offset..<offset+32]
+        }
+}

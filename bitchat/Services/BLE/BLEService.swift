@@ -17,21 +17,12 @@ import UIKit
 final class BLEService: NSObject {
     
     // MARK: - Constants
-    
-
-    static let meshtasticServiceCBUUID = Meshtastic.meshtasticServiceCBUUID
-    static let meshtasticTORADIO_UUID = Meshtastic.meshtasticTORADIO_UUID
-    static let meshtasticFROMRADIO_UUID = Meshtastic.meshtasticFROMRADIO_UUID
-    static let meshtasticFROMNUM_UUID = Meshtastic.meshtasticFROMNUM_UUID
-    static let meshtasticLOGRADIO_UUID = Meshtastic.meshtasticLOGRADIO_UUID
-    
     #if DEBUG
         #if os(macOS)
         static let serviceUUID = CBUUID(string: "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5A") // testnet
         #else
         static let serviceUUID = CBUUID(string: "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C") // mainnet
         #endif
-    
     #else
     static let serviceUUID = CBUUID(string: "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C") // mainnet
     #endif
@@ -42,7 +33,7 @@ final class BLEService: NSObject {
     static let characteristicUUID = CBUUID(string: "A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D")
     #endif
     
-    public let serviceToDiscover = [BLEService.serviceUUID, BLEService.meshtasticServiceCBUUID] // A list of discoveries
+    private let serviceToDiscover = [BLEService.serviceUUID, BLEService.meshtasticServiceCBUUID] // A list of discoveries
     
     private static let centralRestorationID = "chat.bitchat.ble.central"
     private static let peripheralRestorationID = "chat.bitchat.ble.peripheral"
@@ -71,11 +62,11 @@ final class BLEService: NSObject {
         var fromRadioCharacteristic: CBCharacteristic?
     }
     
-    private var peripherals: [String: PeripheralState] = [:]  // UUID -> PeripheralState
+    internal var peripherals: [String: PeripheralState] = [:]  // UUID -> PeripheralState
     
     
     // A list for all meshtastic devices connected, and their states
-    private var meshtasticServices: [(service: CBService, peripheral: CBPeripheral, connected: Bool)]
+    internal var meshtasticServices: [(service: CBService, peripheral: CBPeripheral, connected: Bool)]
     
     // A list for sent packages, so we can avoid sending packets twice:
     // meshtastic don't support flooding and Europe's limitations caps the rate
@@ -86,7 +77,7 @@ final class BLEService: NSObject {
     }
     
     
-    private var peerToPeripheralUUID: [PeerID: String] = [:]  // PeerID -> Peripheral UUID
+    internal var peerToPeripheralUUID: [PeerID: String] = [:]  // PeerID -> Peripheral UUID
     
     // 2. BLE Centrals (when acting as peripheral)
     public var subscribedCentrals: [CBCentral] = []
@@ -102,7 +93,7 @@ final class BLEService: NSObject {
     private var centralSubscriptionRateLimits: [String: SubscriptionRateLimitState] = [:]  // Central UUID -> rate limit state
     
     // 3. Peer Information (single source of truth)
-    private struct PeerInfo {
+    internal struct PeerInfo {
         let peerID: PeerID
         var nickname: String
         var isConnected: Bool
@@ -110,9 +101,10 @@ final class BLEService: NSObject {
         var signingPublicKey: Data?
         var isVerifiedNickname: Bool
         var lastSeen: Date
+        var meshtastic: String? // If connected via meshtastic
     }
-    private var peers: [PeerID: PeerInfo] = [:]
-    private var currentPeerIDs: [PeerID] {
+    internal var peers: [PeerID: PeerInfo] = [:]
+    internal var currentPeerIDs: [PeerID] {
         Array(peers.keys)
     }
     
@@ -156,22 +148,22 @@ final class BLEService: NSObject {
     
     // MARK: - Identity
     
-    private var noiseService: NoiseEncryptionService
-    private let identityManager: SecureIdentityStateManagerProtocol
-    private let keychain: KeychainManagerProtocol
-    private let idBridge: NostrIdentityBridge
-    private var myPeerIDData: Data = Data()
+    internal var noiseService: NoiseEncryptionService
+    internal let identityManager: SecureIdentityStateManagerProtocol
+    internal let keychain: KeychainManagerProtocol
+    internal let idBridge: NostrIdentityBridge
+    internal var myPeerIDData: Data = Data()
 
     // MARK: - Advertising Privacy
     // No Local Name by default for maximum privacy. No rotating alias.
     
     // MARK: - Queues
     
-    private let messageQueue = DispatchQueue(label: "mesh.message", attributes: .concurrent)
-    private let collectionsQueue = DispatchQueue(label: "mesh.collections", attributes: .concurrent)
-    private let messageQueueKey = DispatchSpecificKey<Void>()
-    private let bleQueue = DispatchQueue(label: "mesh.bluetooth", qos: .userInitiated)
-    private let bleQueueKey = DispatchSpecificKey<Void>()
+    internal let messageQueue = DispatchQueue(label: "mesh.message", attributes: .concurrent)
+    internal let collectionsQueue = DispatchQueue(label: "mesh.collections", attributes: .concurrent)
+    internal let messageQueueKey = DispatchSpecificKey<Void>()
+    internal let bleQueue = DispatchQueue(label: "mesh.bluetooth", qos: .userInitiated)
+    internal let bleQueueKey = DispatchSpecificKey<Void>()
     
     // Queue for messages pending handshake completion
     private var pendingMessagesAfterHandshake: [PeerID: [(content: String, messageID: String)]] = [:]
@@ -943,6 +935,8 @@ final class BLEService: NSObject {
             return true
         case .none, .announce, .message, .leave, .requestSync, .fragment, .fileTransfer:
             return false
+        case .mttHello, .mttHelloBack:
+            return false
         }
     }
 
@@ -1030,7 +1024,7 @@ final class BLEService: NSObject {
         }
     }
 
-    private func sendOnAllLinks(packet: BitchatPacket, data: Data, pad: Bool, directedOnlyPeer: PeerID?) {
+    internal func sendOnAllLinks(packet: BitchatPacket, data: Data, pad: Bool, directedOnlyPeer: PeerID?) {
         // Determine last-hop link for this message to avoid echoing back
         let messageID = makeMessageID(for: packet)
         let ingressLink: LinkID? = collectionsQueue.sync { ingressByMessageID[messageID]?.link }
@@ -1137,7 +1131,7 @@ final class BLEService: NSObject {
                 
                 
                 // Send the payload (actual message content), not the entire BitchatPacket
-                let takData = Meshtastic.toMeshtasticData(data)
+                let takData = BLEService.toMeshtasticData(data)
                 if !takData.isEmpty {
                     writeOrEnqueue(takData, to: s.peripheral, characteristic: radio, priority: outboundPriority)
                     meshtasticSentPacketIDs.insert(packetID) // Count this one as sent
@@ -1183,7 +1177,7 @@ final class BLEService: NSObject {
         }
     }
 
-    private func flushDirectedSpool() {
+    public func flushDirectedSpool() {
         // Move items out and attempt broadcast; if still no links, they'll be re-spooled
         let toSend: [(String, BitchatPacket)] = collectionsQueue.sync(flags: .barrier) {
             var out: [(String, BitchatPacket)] = []
@@ -1598,7 +1592,7 @@ final class BLEService: NSObject {
         }
     }
 
-    private func sendAnnounce(forceSend: Bool = false) {
+    public func sendAnnounce(forceSend: Bool = false) {
         // Throttle announces to prevent flooding
         let now = Date()
         let timeSinceLastAnnounce = now.timeIntervalSince(lastAnnounceSent)
@@ -2190,114 +2184,7 @@ extension BLEService: CBPeripheralDelegate {
         peripheral.discoverCharacteristics([BLEService.characteristicUUID, BLEService.meshtasticFROMRADIO_UUID, BLEService.meshtasticTORADIO_UUID, BLEService.meshtasticFROMNUM_UUID], for: service)
     }
     
-    public func connectToMeshtastic(peripheral: CBPeripheral, service: CBService) {
-        // pair the device
-        peripheral.delegate = self
-        SecureLogger.debug("✨ Connecting to a Meshtastic Radio")
-        
-        guard let characteristics = service.characteristics else { return }
-        
-        var foundToRadio: CBCharacteristic?
-        var foundFromRadio: CBCharacteristic?
-        var foundFromNum: CBCharacteristic?
-        let peripheralID = peripheral.identifier.uuidString
-    
-        
-        for characteristic in characteristics {
-            let props = characteristic.properties
-            SecureLogger.debug("🔍 Props from \(characteristic.uuid): \(props.rawValue)")
 
-            switch characteristic.uuid {
-            case BLEService.meshtasticTORADIO_UUID:
-                foundToRadio = characteristic
-                SecureLogger.debug("✅ Found TORADIO")
-
-            case BLEService.meshtasticFROMRADIO_UUID:
-                foundFromRadio = characteristic
-                SecureLogger.debug("✅ Found FROMRADIO")
-                
-            case BLEService.meshtasticFROMNUM_UUID:
-                foundFromNum = characteristic
-                SecureLogger.debug("✅ Found FROMNUM")
-                
-            default:
-                break
-            }
-        }
-        
-        guard let toRadio = foundToRadio, let fromRadio = foundFromRadio else {
-            SecureLogger.error("❌ Missing mandatory characteristics")
-            return
-        }
-        
-        if var state = peripherals[peripheralID] {
-            state.toRadioCharacteristic = toRadio
-            state.fromRadioCharacteristic = fromRadio
-            state.isConnected = true
-            peripherals[peripheralID] = state
-        } else {
-            // Create new peripheral state if it doesn't exist
-            let newState = PeripheralState(
-                peripheral: peripheral,
-                characteristic: nil,
-                peerID: nil,
-                isConnecting: false,
-                isConnected: true,
-                lastConnectionAttempt: nil,
-                assembler: NotificationStreamAssembler(),
-                toRadioCharacteristic: toRadio,
-                fromRadioCharacteristic: fromRadio
-            )
-            peripherals[peripheralID] = newState
-        }
-        
-        
-        // Notify Ui immediatly
-        notifyUI {
-            // Now we can register a new Peer in order to receive packets from theme
-            //let newPeer = PeerID(str: peripheral.name ?? "mtt:unknown")
-            //let newPeerInfo = PeerInfo(peerID: newPeer, nickname: "mtt:" + (peripheral.name ?? ""), isConnected: true, isVerifiedNickname: true, lastSeen: Date(timeIntervalSinceNow: 0))
-            let newPeerID = PeerID(str: "0x1234")
-            let newPeerInfo = PeerInfo(peerID: newPeerID, nickname: "mtt:" + (peripheral.name ?? ""), isConnected: true, isVerifiedNickname: true, lastSeen: Date(timeIntervalSinceNow: 0))
-            self.peers[newPeerID] = newPeerInfo
-            self.peerToPeripheralUUID[newPeerID] = peripheralID
-            
-            // Set the mtt device to connected
-            if let index = self.meshtasticServices.firstIndex(where: { $0.peripheral.identifier == peripheral.identifier}) {
-                self.meshtasticServices[index].connected = true
-            }
-        }
-
-        SecureLogger.debug("✅ Stored Meshtastic characteristics for \(peripheral.name ?? "Unknown")", category: .session)
-        
-        // Meshtastic Handshake to connect to the radio
-        let configId = UInt32.random(in: 1...UInt32.max)
-        var toRadioPacket = ToRadio()
-        toRadioPacket.wantConfigID = configId
-        if let data = try? toRadioPacket.serializedData() {
-            peripheral.writeValue(data, for: toRadio, type: .withResponse)
-            SecureLogger.debug("📤 Sent want_config_id: \(configId)")
-        }
-        peripheral.readValue(for: fromRadio)
-    
-        // We can the finnaly subscribe to from num
-        if let fromNum = foundFromNum {
-            messageQueue.asyncAfter(deadline: .now() + 0.5) {
-                peripheral.setNotifyValue(true, for: fromNum)
-                SecureLogger.debug("🔔 Subscribed to FROMNUM")
-            }
-        }
-        messageQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.sendAnnounce(forceSend: true)
-            self?.flushDirectedSpool()
-        }
-        SecureLogger.info("✨ Meshtastic Handshake Complete for \(peripheral.name ?? "Unknown")", category: .session)
-    }
-    
-    public func handleFromRadio(bytes: Data) {
-        
-    }
-    
     public func disconnectFromMeshtastic(peripheral: CBPeripheral) {
         let peripheralID = peripheral.identifier.uuidString
         
@@ -2431,60 +2318,8 @@ extension BLEService: CBPeripheralDelegate {
                }
 
             case BLEService.meshtasticFROMRADIO_UUID:
-                guard let data = characteristic.value, !data.isEmpty else {
-                    SecureLogger.debug("📭 FROMRADIO empty — drain complete")
-                    return
-                }
-                
-                // Parser le FromRadio protobuf
-                do {
-                    let fromRadio = try FromRadio(serializedBytes: data)
-                    
-                    switch fromRadio.payloadVariant {
-                        
-                    case .packet(let meshPacket):
-                        // C'est un vrai packet mesh
-                        switch meshPacket.payloadVariant {
-                            
-                        case .decoded(let decoded):
-                            switch decoded.portnum {
-                                
-                            case .atakPlugin:
-                                SecureLogger.info("🎯 ATAK packet received — \(decoded.payload.count) bytes")
-                                bufferNotificationChunk(data, from: peripheral)
-                                
-                            case .textMessageApp:
-                                SecureLogger.info("💬 Text message Meshtastic")
-                                
-                            case .positionApp:
-                                SecureLogger.debug("📍 Position packet — ignoré")
-                                
-                            default:
-                                SecureLogger.debug("📦 Portnum ignoré: \(decoded.portnum)")
-                            }
-                            
-                        case .encrypted:
-                            // Packet chiffré non décodable (pas notre channel)
-                            SecureLogger.debug("🔒 Encrypted packet — ignoré")
-                            
-                        default:
-                            break
-                        }
-                        
-                    case .myInfo(let info):
-                        SecureLogger.info("ℹ️ MyInfo reçu: nodeNum=\(info.myNodeNum)")
-                        
-                    case .nodeInfo(let node):
-                        SecureLogger.debug("👤 NodeInfo: \(node.user.longName)")
-                        
-                    default:
-                        SecureLogger.debug("📨 FromRadio payload ignoré: \(fromRadio.payloadVariant, default: "#ignored")")
-                    }
-                    
-                } catch {
-                    SecureLogger.error("❌ Protobuf parse error: \(error)")
-                }
-            
+                getDataFromMeshtastic(peripheral: peripheral, characteristic: characteristic)
+
                 // Continue to drain
                 peripheral.readValue(for: characteristic)
 
@@ -2501,7 +2336,7 @@ extension BLEService: CBPeripheralDelegate {
            }
     }
 
-    private func bufferNotificationChunk(_ chunk: Data, from peripheral: CBPeripheral) {
+    public func bufferNotificationChunk(_ chunk: Data, from peripheral: CBPeripheral) {
         let peripheralUUID = peripheral.identifier.uuidString
         
         var state = peripherals[peripheralUUID] ?? PeripheralState(
@@ -2516,54 +2351,19 @@ extension BLEService: CBPeripheralDelegate {
             fromRadioCharacteristic: nil,
         )
         
-        var newChunk: Data
-        
         // Receive data from MTT radio
         if let _ = state.fromRadioCharacteristic {
-            // This is data from a Meshtastic radio
-            SecureLogger.info("📡 Received \(chunk.count) bytes from Meshtastic radio: \(state.peripheral.name ?? "unknown")")
-            
-            // Try to extract the message payload from the Meshtastic FromRadio envelope
-            if let messageData = Meshtastic.toBitchat(chunk) {
-                SecureLogger.info("📡 Extracted \(messageData.count) bytes from Meshtastic packet")
-                newChunk = messageData
-                if let originalPacket = BinaryProtocol.decode(messageData) {
-                    // Create a peer ID based on the Meshtastic device name
-                    let meshtasticPeerID = PeerID(str: "0x1234")
-                    
-                    // Create a new packet with the Meshtastic device as sender
-                    let modifiedPacket = BitchatPacket(
-                        type: originalPacket.type,
-                        senderID: Data(hexString: meshtasticPeerID.id) ?? Data(),
-                        recipientID: originalPacket.recipientID,
-                        timestamp: originalPacket.timestamp,
-                        payload: originalPacket.payload,
-                        signature: originalPacket.signature,
-                        ttl: originalPacket.ttl,
-                        version: originalPacket.version,
-                        route: originalPacket.route,
-                        isRSR: originalPacket.isRSR
-                    )
-                    
-                    processNotificationPacket(modifiedPacket, from: peripheral, peripheralUUID: peripheralUUID)
-                } else {
-                    SecureLogger.error("❌ Could not process packet from Meshtastic")
-                }
-                return
-            } else {
-                SecureLogger.warning("📡 Could not extract message from Meshtastic data", category: .session)
-                newChunk = Data()
-            }
+            handleMeshtasticPacket(chunk: chunk, peripheral: peripheral, state: state)
+            return
         } else {
             // Check if this should be a Meshtastic device but characteristics weren't stored
             if peripherals[peripheralUUID] == nil {
                 SecureLogger.warning("⚠️ Received notification from peripheral \(peripheralUUID.prefix(8))... but no state found in peripherals dictionary", category: .session)
             }
-            newChunk = chunk
         }
         
         var assembler = state.assembler
-        let result = assembler.append(newChunk)
+        let result = assembler.append(chunk)
         state.assembler = assembler
         peripherals[peripheralUUID] = state
 
@@ -2590,7 +2390,7 @@ extension BLEService: CBPeripheralDelegate {
         }
     }
 
-    private func processNotificationPacket(_ packet: BitchatPacket, from peripheral: CBPeripheral, peripheralUUID: String) {
+    public func processNotificationPacket(_ packet: BitchatPacket, from peripheral: CBPeripheral, peripheralUUID: String) {
         let senderID = PeerID(hexData: packet.senderID)
 
         if packet.type != MessageType.announce.rawValue {
@@ -3067,7 +2867,7 @@ extension BLEService {
 extension BLEService {
     
     /// Notify UI on the MainActor to satisfy Swift concurrency isolation
-    private func notifyUI(_ block: @escaping () -> Void) {
+    internal func notifyUI(_ block: @escaping () -> Void) {
         // Always hop onto the MainActor so calls to @MainActor delegates are safe
         Task { @MainActor in
             block()
@@ -4165,6 +3965,12 @@ extension BLEService {
         case .leave:
             handleLeave(packet, from: senderID)
             
+        case .mttHello:
+            handleHelloBitchat(packet, from: senderID)
+            
+        case .mttHelloBack:
+            handleHelloBackBitchat(packet, from: senderID)
+            
         case .none:
             SecureLogger.warning("⚠️ Unknown message type: \(packet.type)", category: .session)
             break
@@ -4789,6 +4595,24 @@ extension BLEService {
             for (peerID, peer) in peers {
                 let age = now.timeIntervalSince(peer.lastSeen)
                 let retention: TimeInterval = peer.isVerifiedNickname ? TransportConfig.bleReachabilityRetentionVerifiedSeconds : TransportConfig.bleReachabilityRetentionUnverifiedSeconds
+                
+                if let mttName = peer.meshtastic {
+                    if peer.isConnected && age > BLEService.meshtasticPeerInactivityTimeoutSeconds {
+                        let state = cachedLinkStates[peerID] ?? (hasPeripheral: false, hasCentral: false)
+                        let hasPeripheralConnection = state.hasPeripheral
+                        let hasCentralConnection = state.hasCentral
+                        
+                        // If direct link is gone, mark as not connected (retain entry for reachability)
+                        if !hasPeripheralConnection && !hasCentralConnection {
+                            var updated = peer
+                            updated.isConnected = false
+                            peers[peerID] = updated
+                            disconnectedPeers.append(peerID)
+                        }
+                    }
+                    continue
+                }
+                
                 if peer.isConnected && age > TransportConfig.blePeerInactivityTimeoutSeconds {
                     // Check if we still have an active BLE connection to this peer
                     let state = cachedLinkStates[peerID] ?? (hasPeripheral: false, hasCentral: false)
