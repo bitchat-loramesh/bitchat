@@ -8,6 +8,7 @@
 
 import SwiftUI
 import CoreBluetooth
+import BitLogger
 
 /// A view for discovering and managing Meshtastic radio connections via Bluetooth
 struct MeshtasticManagementView: View {
@@ -24,6 +25,27 @@ struct MeshtasticManagementView: View {
     
     /// State to force view refresh
     @State private var refreshID = UUID()
+    
+    /// Cooldown timer state
+    @State private var remainingSeconds: Int = 0
+    @State private var timer: Timer?
+    
+    /// UserDefaults key for storing last activation time
+    private static let lastActivationTimeKey = "MeshtasticManagementView.lastHelloActivationTime"
+    
+    /// Persistent last activation time stored in UserDefaults
+    private var lastActivationTime: Date? {
+        UserDefaults.standard.object(forKey: Self.lastActivationTimeKey) as? Date
+    }
+    
+    /// Set the last activation time in UserDefaults
+    private func setLastActivationTime(_ date: Date?) {
+        if let date = date {
+            UserDefaults.standard.set(date, forKey: Self.lastActivationTimeKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.lastActivationTimeKey)
+        }
+    }
     
     // MARK: - Computed Properties
     
@@ -42,6 +64,12 @@ struct MeshtasticManagementView: View {
         textColor.opacity(0.7)
     }
     
+    /// Check if the button is available (cooldown expired)
+    private var isButtonAvailable: Bool {
+        guard let lastTime = lastActivationTime else { return true }
+        return Date().timeIntervalSince(lastTime) >= 60
+    }
+    
     // MARK: - Body
     
     var body: some View {
@@ -56,6 +84,12 @@ struct MeshtasticManagementView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     // Bluetooth status section
                     bluetoothStatusSection
+                    
+                    Divider()
+                        .padding(.vertical, 8)
+                    
+                    // Cooldown button section
+                    cooldownButtonSection
                     
                     Divider()
                         .padding(.vertical, 8)
@@ -80,6 +114,8 @@ struct MeshtasticManagementView: View {
             refreshID = UUID()
         }
         .onAppear {
+            startHelloCooldownTimer()
+            
             // Set up a timer to periodically refresh on macOS
             #if os(macOS)
             Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { timer in
@@ -90,6 +126,9 @@ struct MeshtasticManagementView: View {
                 }
             }
             #endif
+        }
+        .onDisappear {
+            stopHelloCooldownTimer()
         }
     }
     
@@ -146,6 +185,66 @@ struct MeshtasticManagementView: View {
         }
     }
     
+    /// Cooldown button section with timer
+    private var cooldownButtonSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Request Hello")
+                .font(.bitchatSystem(size: 14, weight: .semibold, design: .monospaced))
+                .foregroundColor(textColor)
+            
+            if viewModel.meshService is BLEService {
+                let bleService = viewModel.meshService as! BLEService
+                let devices = bleService.getMeshtasticDevices()
+                let hasConnectedDevice = devices.contains { $0.2 == true }
+                
+                Button(action: { handleHelloRequestAction(bleService: bleService) }) {
+                    HStack(spacing: 8) {
+                        if isButtonAvailable {
+                            Image(systemName: "paperplane.fill")
+                                .font(.bitchatSystem(size: 14, design: .monospaced))
+                            Text("Send Hello Request")
+                                .font(.bitchatSystem(size: 13, weight: .medium, design: .monospaced))
+                        } else {
+                            Image(systemName: "clock.fill")
+                                .font(.bitchatSystem(size: 14, design: .monospaced))
+                            Text("Wait \(remainingSeconds)s")
+                                .font(.bitchatSystem(size: 13, weight: .medium, design: .monospaced))
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(isButtonAvailable && hasConnectedDevice ? textColor.opacity(0.1) : Color.gray.opacity(0.2))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(isButtonAvailable && hasConnectedDevice ? textColor : Color.gray, lineWidth: 1)
+                    )
+                }
+                .disabled(!isButtonAvailable || !hasConnectedDevice)
+                .buttonStyle(.plain)
+                .opacity(isButtonAvailable && hasConnectedDevice ? 1.0 : 0.5)
+                
+                if !hasConnectedDevice {
+                    Text("Connect to a device first")
+                        .font(.bitchatSystem(size: 11, design: .monospaced))
+                        .foregroundColor(Color.orange)
+                }
+                
+                if let lastTime = lastActivationTime {
+                    Text("Last activated: \(lastTime, formatter: timeFormatter)")
+                        .font(.bitchatSystem(size: 11, design: .monospaced))
+                        .foregroundColor(secondaryTextColor)
+                } else {
+                    Text("Never activated")
+                        .font(.bitchatSystem(size: 11, design: .monospaced))
+                        .foregroundColor(secondaryTextColor)
+                }
+            }
+        }
+    }
+    
     /// List of discovered Meshtastic devices
     private var discoveredDevicesSection: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -157,7 +256,7 @@ struct MeshtasticManagementView: View {
                 let bleService = viewModel.meshService as! BLEService
                 // Force re-evaluation by accessing viewModel's published objectWillChange
                 let _ = viewModel.objectWillChange
-                let devices = bleService.getMeshtasticDevice()
+                let devices = bleService.getMeshtasticDevices()
                 
                 if devices.isEmpty {
                     Text("No Meshtastic devices found")
@@ -241,6 +340,69 @@ struct MeshtasticManagementView: View {
     }
     
     // MARK: - Helper Methods
+    
+    /// Handle button action when clicked
+    private func handleHelloRequestAction(bleService: BLEService) {
+        guard isButtonAvailable else { return }
+        
+        // Add diagnostic logging
+        let devices = bleService.getMeshtasticDevices()
+        let connectedDevices = devices.filter { $0.2 == true }
+        SecureLogger.info("🔍 Attempting to send hello to \(connectedDevices.count) connected device(s)")
+        
+        for (_, peripheral, isConnected) in connectedDevices {
+            SecureLogger.info("🔍 Device: \(peripheral.name ?? "Unknown"), UUID: \(peripheral.identifier), Connected: \(isConnected)")
+        }
+        
+        bleService.requestHelloBroadcast()
+        
+        // Record activation time in UserDefaults for persistence
+        setLastActivationTime(Date())
+        
+        // Immediately update the UI
+        updateHelloRemainingTime()
+    }
+    
+    /// Start the cooldown timer for the hello button
+    private func startHelloCooldownTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            updateHelloRemainingTime()
+        }
+    }
+    
+    /// Stop the cooldown timer for the hello button
+    private func stopHelloCooldownTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+    
+    /// Update the remaining seconds for the cooldown
+    private func updateHelloRemainingTime() {
+        guard let lastTime = lastActivationTime else {
+            remainingSeconds = 0
+            return
+        }
+        
+        let elapsed = Date().timeIntervalSince(lastTime)
+        let remaining = max(0, 60 - Int(elapsed))
+        
+        remainingSeconds = remaining
+        
+        // Stop timer when cooldown is complete
+        if remaining == 0 && timer != nil {
+            // Keep timer running but reset state
+            setLastActivationTime(nil)
+        }
+    }
+    
+    /// Formatter for displaying time
+    private var timeFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter
+    }
     
     /// Returns appropriate color for signal strength
     private func signalColor(for rssi: Int) -> Color {

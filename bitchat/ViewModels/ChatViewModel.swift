@@ -3715,18 +3715,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         return Data(base64Encoded: str)
     }
     
-    //
-    
-
-    
-
-    
-
-    
-
-    
-
-    
     /// Handle incoming public message
     @MainActor
     func handlePublicMessage(_ message: BitchatMessage) {
@@ -3783,24 +3771,24 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         }
     }
     
-        /// Check for mentions and send notifications
-        
-        func checkForMentions(_ message: BitchatMessage) {    // Determine our acceptable mention token. If any connected peer shares our nickname,
-    // require the disambiguated form '<nickname>#<peerIDprefix>' to trigger.
-    var myTokens: Set<String> = [nickname]
-    let meshPeers = meshService.getPeerNicknames()
-    let collisions = meshPeers.values.filter { $0.hasPrefix(nickname + "#") }
-    if !collisions.isEmpty {
-        let suffix = "#" + String(meshService.myPeerID.id.prefix(4))
-        myTokens = [nickname + suffix]
-    }
-    let isMentioned = (message.mentions?.contains { myTokens.contains($0) } ?? false)
+    /// Check for mentions and send notifications
+    
+    func checkForMentions(_ message: BitchatMessage) {    // Determine our acceptable mention token. If any connected peer shares our nickname,
+        // require the disambiguated form '<nickname>#<peerIDprefix>' to trigger.
+        var myTokens: Set<String> = [nickname]
+        let meshPeers = meshService.getPeerNicknames()
+        let collisions = meshPeers.values.filter { $0.hasPrefix(nickname + "#") }
+        if !collisions.isEmpty {
+            let suffix = "#" + String(meshService.myPeerID.id.prefix(4))
+            myTokens = [nickname + suffix]
+        }
+        let isMentioned = (message.mentions?.contains { myTokens.contains($0) } ?? false)
 
-    if isMentioned && message.sender != nickname {
-        SecureLogger.info("🔔 Mention from \(message.sender)", category: .session)
-        NotificationService.shared.sendMentionNotification(from: message.sender, message: message.content)
+        if isMentioned && message.sender != nickname {
+            SecureLogger.info("🔔 Mention from \(message.sender)", category: .session)
+            NotificationService.shared.sendMentionNotification(from: message.sender, message: message.content)
+        }
     }
-}
 
     /// Send haptic feedback for special messages (iOS only)
     func sendHapticFeedback(for message: BitchatMessage) {        #if os(iOS)

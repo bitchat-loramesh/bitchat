@@ -296,7 +296,7 @@ extension BLEService {
         }
         SecureLogger.info("✨ Meshtastic Handshake Complete for \(peripheral.name ?? "Unknown"), sending hellos", category: .session)
         
-        sendLazyMttDiscovery(peripheral: peripheral, service: service)
+        sendHello(peripheral: peripheral, service: service)
     }
     
     private func getMyPeerInfo() -> PeerInfo {
@@ -333,7 +333,22 @@ extension BLEService {
                     break
                 }
                 
+                // Process the packet locally (updates UI, stores in history, etc.)
                 processNotificationPacket(originalPacket, from: peripheral, peripheralUUID: peripheral.identifier.uuidString)
+                
+
+                if let packetData = originalPacket.toBinaryData(padding: false) {
+                    sendOnAllLinks(
+                        packet: originalPacket,
+                        data: packetData,
+                        pad: false,
+                        directedOnlyPeer: nil as PeerID?
+                    )
+                    SecureLogger.debug("📡 Forwarded Meshtastic message to Bitchat mesh network", category: .session)
+                } else {
+                    SecureLogger.error("❌ Could not serialize packet for forwarding", category: .session)
+                }
+
             } else {
                 SecureLogger.error("❌ Could not process packet from Meshtastic")
             }
@@ -397,10 +412,9 @@ extension BLEService {
         }
     }
     
-    
     // MARK: -- Meshtastic Hello and HelloBack
     
-    public func sendLazyMttDiscovery(peripheral: CBPeripheral, service: CBService) {
+    public func sendHello(peripheral: CBPeripheral, service: CBService) {
         // Sends the meshtastic handshake for discovery and announcing oursevles
         // Here, just first phase
         // Protocol
@@ -513,132 +527,97 @@ extension BLEService {
             return
         }
         
-        let packetContent = try? deserializePeers(from: packet.payload)
-        
-        if let radioName = packetContent?.meshtasticRadioName {
-            SecureLogger.info("📡 Received Hello from Meshtastic radio: \(radioName)", category: .session)
+        // Deserialize the packet from the Hello protocole
+        guard let packetContent = try? deserializePeers(from: packet.payload) else {
+            SecureLogger.error("❌ Unable to deserialize HelloBack packet from \(peripheral.name ?? "Unknown")")
+            return
         }
         
-        // Acknowledge the sender and all the peers contained in the list of peers
-        notifyUI {
-            var updatedPeers = self.peers
-            var updatedMapping = self.peerToPeripheralUUID
-            
-            for (peerID, peerInfo) in packetContent?.peers ?? [:] {
-                if updatedPeers.contains(where: { $0.key == peerID }) {
-                    let oldPeerInfo = updatedPeers[peerID]!
-                    if oldPeerInfo.lastSeen < peerInfo.lastSeen {
-                        updatedPeers[peerID] = peerInfo
-                    }
-                    continue
-                }
-                SecureLogger.warning("🚨 Received unknown peer: \(peerID) aka \(peerInfo.nickname)")
-                updatedPeers[peerID] = peerInfo
-                updatedMapping[peerID] = peripheral.identifier.uuidString
-            }
-            
-            // Reassign the entire dictionary to trigger @Published
-            self.peers = updatedPeers
-            
-            // We can map peerID -> peripheral because this peripheral is directly linked
-            self.peerToPeripheralUUID = updatedMapping
-        }
+        SecureLogger.info("👋 Received Hello n°\(packetContent.helloId) from radio: \(packetContent.meshtasticRadioName)")
+        
+        // We can then update from the data we unserialized
+        updateFromHelloPacket(packetContent: packetContent, directLink: peripheral.identifier.uuidString)
         
         // Wait a few seconds before sending HelloBack to avoid network congestion
         self.messageQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            self?.sendHelloBack(peripheral: peripheral, characteristic: toRadio, helloId: packetContent?.helloId ?? 0)
+            self?.sendHelloBack(peripheral: peripheral, characteristic: toRadio, helloId: packetContent.helloId)
         }
         
+        // SendOnAllLinks ignores Hello and HelloBack packets, send without fearing redundance
         sendOnAllLinks(packet: packet, data: packet.toBinaryData() ?? Data(), pad: false, directedOnlyPeer: nil as PeerID?)
     }
     
     public func handleReceiveHelloBack(packet: BitchatPacket, peripheral: CBPeripheral) {
-        // Acknowledge the sender and all the peers contained in the list of peers
-        let packetContent = try? deserializePeers(from: packet.payload)
-        
-        SecureLogger.info("👋 Received HelloBack n°\(packetContent?.helloId ?? 0) from radio: \(packetContent?.meshtasticRadioName ?? "Unknown")")
-        
-        notifyUI {
-            var updatedPeers = self.peers
-            var updatedMapping = self.peerToPeripheralUUID
-            
-            for (peerID, peerInfo) in packetContent?.peers ?? [:] {
-                if updatedPeers.contains(where: { $0.key == peerID }) {
-                    let oldPeerInfo = updatedPeers[peerID]!
-                    if oldPeerInfo.lastSeen < peerInfo.lastSeen {
-                        updatedPeers[peerID] = peerInfo
-                    }
-                    continue
-                }
-                SecureLogger.warning("🚨 Received unknown peer: \(peerID) aka \(peerInfo.nickname)")
-                updatedPeers[peerID] = peerInfo
-                
-                // We can map peerID -> peripheral because this peripheral is directly linked
-                updatedMapping[peerID] = peripheral.identifier.uuidString
-            }
-            
-            // Reassign the entire dictionary to trigger @Published
-            self.peers = updatedPeers
-            self.peerToPeripheralUUID = updatedMapping
+        // Deserialize the packet from the HelloBack protocole (almost the same as hello)
+        guard let packetContent = try? deserializePeers(from: packet.payload) else {
+            SecureLogger.error("❌ Unable to deserialize HelloBack packet from \(peripheral.name ?? "Unknown")")
+            return
         }
+        
+        SecureLogger.info("👋 Received HelloBack n°\(packetContent.helloId) from radio: \(packetContent.meshtasticRadioName)")
+        
+        // We can then update from the data we unserialized
+        updateFromHelloPacket(packetContent: packetContent, directLink: peripheral.identifier.uuidString)
+        
+        // SendOnAllLinks ignores Hello and HelloBack packets, send without fearing redundance
         sendOnAllLinks(packet: packet, data: packet.toBinaryData() ?? Data(), pad: false, directedOnlyPeer: nil as PeerID?)
     }
     
     // MARK: -- Bitchat-side meshtastic packets
     
     public func handleHelloBitchat(_ packet: BitchatPacket, from: PeerID) {
-        let packetContent = try? deserializePeers(from: packet.payload)
-        
-        if let radioName = packetContent?.meshtasticRadioName {
-            SecureLogger.info("📡 Received Hello from Bitchat peer via radio: \(radioName)", category: .session)
+        // Deserialize the packet from the Hello protocole
+        guard let packetContent = try? deserializePeers(from: packet.payload) else {
+            SecureLogger.error("❌ Unable to deserialize HelloBack packet from bitchat")
+            return
         }
         
-        // Acknowledge the sender and all the peers contained in the list of peers
-        notifyUI {
-            var updatedPeers = self.peers
-            
-            for (peerID, peerInfo) in packetContent?.peers ?? [:] {
-                if updatedPeers.contains(where: { $0.key == peerID }) {
-                    let oldPeerInfo = updatedPeers[peerID]!
-                    if oldPeerInfo.lastSeen < peerInfo.lastSeen {
-                        updatedPeers[peerID] = peerInfo
-                    }
-                    continue
-                }
-                SecureLogger.warning("🚨 Received unknown peer: \(peerID) aka \(peerInfo.nickname)")
-                updatedPeers[peerID] = peerInfo
-            }
-            
-            // Reassign the entire dictionary to trigger @Published
-            self.peers = updatedPeers
-        }
+        SecureLogger.info("👋 Received Hello n°\(packetContent.helloId) from radio: \(packetContent.meshtasticRadioName)")
+        
+        // We can then update from the data we unserialized
+        updateFromHelloPacket(packetContent: packetContent, directLink: nil)
     }
     
     public func handleHelloBackBitchat(_ packet: BitchatPacket, from: PeerID) {
-        let packetContent = try? deserializePeers(from: packet.payload)
-        
-        if let radioName = packetContent?.meshtasticRadioName {
-            SecureLogger.info("👋 Received HelloBack from Bitchat peer via radio: \(radioName)", category: .session)
+        // Deserialize the packet from the Hello protocole
+        guard let packetContent = try? deserializePeers(from: packet.payload) else {
+            SecureLogger.error("❌ Unable to deserialize HelloBack packet from bitchat")
+            return
         }
         
-        // Acknowledge the sender and all the peers contained in the list of peers
+        SecureLogger.info("👋 Received Hello n°\(packetContent.helloId) from radio: \(packetContent.meshtasticRadioName)")
+        
+        // We can then update from the data we unserialized
+        updateFromHelloPacket(packetContent: packetContent, directLink: nil)
+    }
+    
+    private func updateFromHelloPacket(packetContent: (helloId: UInt16, meshtasticRadioName: String, peers: [PeerID: PeerInfo]), directLink: String?) {
         notifyUI {
             var updatedPeers = self.peers
             
-            for (peerID, peerInfo) in packetContent?.peers ?? [:] {
-                if updatedPeers.contains(where: { $0.key == peerID }) {
-                    let oldPeerInfo = updatedPeers[peerID]!
-                    if oldPeerInfo.lastSeen < peerInfo.lastSeen {
-                        updatedPeers[peerID] = peerInfo
-                    }
-                    continue
-                }
-                SecureLogger.warning("🚨 Received unknown peer: \(peerID) aka \(peerInfo.nickname)")
+            var updatedMapping = self.peerToPeripheralUUID
+        
+            
+            for (peerID, var peerInfo) in packetContent.peers {
+                peerInfo.meshtastic = packetContent.meshtasticRadioName
                 updatedPeers[peerID] = peerInfo
+                if let stringUUID = directLink {
+                    updatedMapping[peerID] = stringUUID
+                }
             }
             
-            // Reassign the entire dictionary to trigger @Published
+            // Reassign the entire dictionaries to trigger @Published
             self.peers = updatedPeers
+            self.peerToPeripheralUUID = updatedMapping
+        
+            // Now we can publish the peers and update the UI
+            self.publishFullPeerData()
+        }
+    }
+    
+    public func requestHelloBroadcast() {
+        for radio in meshtasticServices {
+            sendHello(peripheral: radio.peripheral, service: radio.service)
         }
     }
 }

@@ -94,7 +94,7 @@ final class UnifiedPeerService: ObservableObject, TransportPeerEventsDelegate {
             let peer = buildPeerFromMesh(
                 peerInfo: peerInfo,
                 favorites: favorites,
-                meshAttached: hasAnyConnected
+                meshAttached: hasAnyConnected,
             )
             
             enrichedPeers.append(peer)
@@ -160,16 +160,13 @@ final class UnifiedPeerService: ObservableObject, TransportPeerEventsDelegate {
         let filtered = enrichedPeers.filter { p in
             p.isConnected || p.isReachable || p.isMutualFavorite
         }
+        
+        // Update all properties atomically
         self.peers = filtered
         self.connectedPeerIDs = connected
         self.favorites = favoritesList
         self.mutualFavorites = mutualsList
         self.peerIndex = newIndex
-        
-        // Log summary (commented out to reduce noise)
-        // let connectedCount = connected.count
-        // let offlineCount = enrichedPeers.count - connectedCount
-        // Peer update: \(enrichedPeers.count) total (\(connectedCount) connected, \(offlineCount) offline)
     }
     
     // MARK: - Peer Building Helpers
@@ -177,7 +174,7 @@ final class UnifiedPeerService: ObservableObject, TransportPeerEventsDelegate {
     private func buildPeerFromMesh(
         peerInfo: TransportPeerSnapshot,
         favorites: [Data: FavoritesPersistenceService.FavoriteRelationship],
-        meshAttached: Bool
+        meshAttached: Bool,
     ) -> BitchatPeer {
         // Determine reachability based on lastSeen and identity trust
         let now = Date()
@@ -195,7 +192,8 @@ final class UnifiedPeerService: ObservableObject, TransportPeerEventsDelegate {
             nickname: peerInfo.nickname,
             lastSeen: peerInfo.lastSeen,
             isConnected: peerInfo.isConnected,
-            isReachable: isReachable
+            isReachable: isReachable,
+            meshtastic: peerInfo.meshtastic
         )
         
         // Check for favorite status
@@ -218,7 +216,10 @@ final class UnifiedPeerService: ObservableObject, TransportPeerEventsDelegate {
             nickname: favorite.peerNickname,
             lastSeen: favorite.lastUpdated,
             isConnected: false,
-            isReachable: false
+            isReachable: false,
+            // MARK: -TODO-
+            // TODO: -- Add meshstastic support to favorite
+            meshtastic: "Unknown"
         )
         
         peer.favoriteStatus = favorite

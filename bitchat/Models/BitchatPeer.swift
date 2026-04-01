@@ -9,6 +9,7 @@ struct BitchatPeer: Equatable {
     let lastSeen: Date
     let isConnected: Bool
     let isReachable: Bool
+    let meshtastic: String? // Tells if the peer is reachable via meshtastic (the string is the name of the radio)
     
     // Favorite-related properties
     var favoriteStatus: FavoritesPersistenceService.FavoriteRelationship?
@@ -78,7 +79,8 @@ struct BitchatPeer: Equatable {
         nickname: String,
         lastSeen: Date = Date(),
         isConnected: Bool = false,
-        isReachable: Bool = false
+        isReachable: Bool = false,
+        meshtastic: String?,
     ) {
         self.peerID = peerID
         self.noisePublicKey = noisePublicKey
@@ -86,6 +88,7 @@ struct BitchatPeer: Equatable {
         self.lastSeen = lastSeen
         self.isConnected = isConnected
         self.isReachable = isReachable
+        self.meshtastic = meshtastic
         
         // Load favorite status - will be set later by the manager
         self.favoriteStatus = nil

@@ -70,9 +70,9 @@ final class BLEService: NSObject {
     
     // A list for sent packages, so we can avoid sending packets twice:
     // meshtastic don't support flooding and Europe's limitations caps the rate
-    private var meshtasticSentPacketIDs: Set<UInt64> = []
+    internal var meshtasticSentPacketIDs: Set<UInt64> = []
     
-    public func getMeshtasticDevice() -> [(service: CBService, peripheral: CBPeripheral, connected: Bool)] {
+    public func getMeshtasticDevices() -> [(service: CBService, peripheral: CBPeripheral, connected: Bool)] {
         return meshtasticServices
     }
     
@@ -522,7 +522,8 @@ final class BLEService: NSObject {
                     nickname: resolvedNames[info.peerID] ?? info.nickname,
                     isConnected: info.isConnected,
                     noisePublicKey: info.noisePublicKey,
-                    lastSeen: info.lastSeen
+                    lastSeen: info.lastSeen,
+                    meshtastic: info.meshtastic
                 )
             }
         }
@@ -1113,28 +1114,30 @@ final class BLEService: NSObject {
             if let ch = s.characteristic {
                 writeOrEnqueue(data, to: s.peripheral, characteristic: ch, priority: outboundPriority)
             } else if let radio = s.toRadioCharacteristic {
-                if packet.type != MessageType.message.rawValue && packet.type != MessageType.noiseEncrypted.rawValue {
-                    SecureLogger.info("📡 Ignored packet of type \(packet.type.description)")
+                // Allow regular messages, encrypted messages
+                // Ignore hello/helloBack packets because it could be redundant from Meshtastic.swift
+                if packet.type != MessageType.message.rawValue
+                    && packet.type != MessageType.noiseEncrypted.rawValue {
+                    SecureLogger.info("📡 Ignored packet of type \(packet.type) = \(MessageType(rawValue: packet.type)?.description ?? "unknown packet type")")
                     continue
                 }
                 
                 // Europe's limitations forces to ignore all duplicate packets
                 // And bitchat tends to spam, so we remove all duplicates
-                let packetID = packet.timestamp  // ou un hash du payload
-                guard !meshtasticSentPacketIDs.contains(packetID) else {
-                    SecureLogger.debug("📡 Skipping duplicate packet \(packetID) for Meshtastic")
-                    continue
-                }
+                let packetID = packet.timestamp
+                //guard !meshtasticSentPacketIDs.contains(packetID) else {
+                //    SecureLogger.debug("📡 Skipping duplicate packet \(packetID) for Meshtastic")
+                //    continue
+                //}
                 
-                SecureLogger.info("📡 Forwarding message to Meshtastic radio (type: \(packet.type))")
+                SecureLogger.info("📡 Forwarding message to Meshtastic radio (type: \(packet.type) \(MessageType(rawValue: packet.type)?.description)")
                 
                 
-                
-                // Send the payload (actual message content), not the entire BitchatPacket
+                // Send the payload
                 let takData = BLEService.toMeshtasticData(data)
                 if !takData.isEmpty {
                     writeOrEnqueue(takData, to: s.peripheral, characteristic: radio, priority: outboundPriority)
-                    meshtasticSentPacketIDs.insert(packetID) // Count this one as sent
+                    meshtasticSentPacketIDs.insert(packetID)
                     SecureLogger.debug("📡 Sent \(takData.count) bytes to Meshtastic", category: .session)
                 } else {
                     SecureLogger.warning("📡 Failed to convert message to Meshtastic format", category: .session)
@@ -1687,6 +1690,13 @@ extension BLEService: GossipSyncManager.Delegate {
     func getConnectedPeers() -> [PeerID] {
         return collectionsQueue.sync {
             peers.values.compactMap { $0.isConnected ? $0.peerID : nil }
+        }
+    }
+    
+    // Return all the non-meshtastic peers connected
+    func getNonMeshtasticConnectedPeers() -> [PeerID] {
+        return collectionsQueue.sync {
+            peers.values.compactMap { ($0.isConnected && $0.meshtastic == nil) ? $0.peerID : nil }
         }
     }
 }
@@ -3090,7 +3100,7 @@ extension BLEService {
     
     // MARK: Link capability snapshots (thread-safe via bleQueue)
     
-    private func snapshotPeripheralStates() -> [PeripheralState] {
+    public func snapshotPeripheralStates() -> [PeripheralState] {
         if DispatchQueue.getSpecific(key: bleQueueKey) != nil {
             return Array(peripherals.values)
         } else {
@@ -4167,7 +4177,11 @@ extension BLEService {
             if (packet.ttl == self.messageTTL) && (isNewPeer || isReconnectedPeer) {
                 self.delegate?.didConnectToPeer(peerID)
                 // Schedule initial unicast sync to this peer
-                self.gossipSyncManager?.scheduleInitialSyncToPeer(peerID, delaySeconds: 1.0)
+                let isMeshtastic = self.collectionsQueue.sync { self.peers[peerID]?.meshtastic != nil }
+                if !isMeshtastic {
+                    self.gossipSyncManager?.scheduleInitialSyncToPeer(peerID, delaySeconds: 1.0)
+                }
+                //self.gossipSyncManager?.scheduleInitialSyncToPeer(peerID, delaySeconds: 1.0)
             }
             
             self.requestPeerDataPublish()
@@ -4246,10 +4260,18 @@ extension BLEService {
             accepted = true
             senderNickname = myNickname
         }
-        else if peerID == PeerID(hexData: Data(hexString: "0x1234")) {
-            // Debug : unknown id from meshtastic
-            senderNickname = peers[PeerID(str: "0x1234")]!.nickname
+        // Check if this peer is known via Meshtastic (even if not directly connected)
+        else if let info = peersSnapshot[peerID], let radioName = info.meshtastic {
+            // Peer came via Meshtastic - accept regardless of verification status
             accepted = true
+            senderNickname = "(mtt:\(radioName))"
+            senderNickname += info.nickname.isEmpty ? "anon" + String(peerID.id.prefix(4)) : info.nickname
+            // Handle nickname collisions
+            let hasCollision = peersSnapshot.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.peerID != peerID } || (myNickname == info.nickname)
+            if hasCollision {
+                senderNickname += "#" + String(peerID.id.prefix(4))
+            }
+            SecureLogger.debug("📡 Accepting message from Meshtastic peer: \(senderNickname) via radio: \(info.meshtastic ?? "Unknown")", category: .session)
         }
         else if let info = peersSnapshot[peerID], info.isVerifiedNickname {
             // Known verified peer path
@@ -4320,6 +4342,35 @@ extension BLEService {
             let dedupID = "\(senderHex)-\(packet.timestamp)-\(packet.type)"
             resolvedSelfMessageID = selfBroadcastMessageIDs.removeValue(forKey: dedupID)?.id
         }
+        
+        // Forward to Meshtastic radios immediately, before relay logic
+        // This ensures Meshtastic gets messages even if RelayController decides not to relay
+        if let data = packet.toBinaryData(padding: false) {
+            // Only forward to Meshtastic peers (don't relay to other Bitchat peers here)
+            let states = snapshotPeripheralStates()
+            let outboundPriority = priority(for: packet, data: data)
+            
+            for s in states where s.isConnected {
+                // Check if this is a Meshtastic radio
+                if let radio = s.toRadioCharacteristic, s.characteristic == nil {
+                    let packetID = packet.timestamp
+                    
+                    // Deduplicate for Meshtastic — prevent flooding
+                    guard !meshtasticSentPacketIDs.contains(packetID) else {
+                        continue
+                    }
+                    
+                    SecureLogger.info("📡 Forwarding received message to Meshtastic radio from handleMessage")
+                    
+                    let takData = BLEService.toMeshtasticData(data)
+                    if !takData.isEmpty {
+                        writeOrEnqueue(takData, to: s.peripheral, characteristic: radio, priority: outboundPriority)
+                        meshtasticSentPacketIDs.insert(packetID)
+                    }
+                }
+            }
+        }
+        
         notifyUI { [weak self] in
             self?.delegate?.didReceivePublicMessage(from: peerID,
                                                     nickname: senderNickname,
@@ -4482,7 +4533,7 @@ extension BLEService {
     }
     
     // NEW: Publish peer snapshots to subscribers and notify Transport delegates
-    private func publishFullPeerData() {
+    internal func publishFullPeerData() {
         let transportPeers: [TransportPeerSnapshot] = collectionsQueue.sync {
             // Compute nickname collision counts for connected peers
             let connected = peers.values.filter { $0.isConnected }
@@ -4499,7 +4550,8 @@ extension BLEService {
                     nickname: display,
                     isConnected: info.isConnected,
                     noisePublicKey: info.noisePublicKey,
-                    lastSeen: info.lastSeen
+                    lastSeen: info.lastSeen,
+                    meshtastic: info.meshtastic, // Tells if a peer is connected via meshtastic
                 )
             }
         }
@@ -4598,6 +4650,7 @@ extension BLEService {
                 
                 if let mttName = peer.meshtastic {
                     if peer.isConnected && age > BLEService.meshtasticPeerInactivityTimeoutSeconds {
+                        SecureLogger.info("🚨 Removing Meshtastic peer due to inactivity")
                         let state = cachedLinkStates[peerID] ?? (hasPeripheral: false, hasCentral: false)
                         let hasPeripheralConnection = state.hasPeripheral
                         let hasCentralConnection = state.hasCentral
@@ -4609,8 +4662,9 @@ extension BLEService {
                             peers[peerID] = updated
                             disconnectedPeers.append(peerID)
                         }
+                    } else {
+                        continue
                     }
-                    continue
                 }
                 
                 if peer.isConnected && age > TransportConfig.blePeerInactivityTimeoutSeconds {
@@ -4629,7 +4683,12 @@ extension BLEService {
                 }
                 // Cleanup: remove peers that are not connected and past reachability retention
                 if !peer.isConnected {
-                    if age > retention {
+                    // Meshtastic peers have a special treatement
+                    let effectiveRetention = peer.meshtastic != nil
+                        ? BLEService.meshtasticPeerInactivityTimeoutSeconds
+                        : retention
+                    SecureLogger.debug("🗑️ Peer \(peer.nickname) is from \(peer.meshtastic ?? "not meshtastic")  (retention \(effectiveRetention)s)")
+                    if age > effectiveRetention {
                         SecureLogger.debug("🗑️ Removing stale peer after reachability window: \(peerID) (\(peer.nickname))", category: .session)
                         // Also remove any stored announcement from sync candidates
                         gossipSyncManager?.removeAnnouncementForPeer(peerID)

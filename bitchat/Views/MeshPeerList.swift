@@ -53,6 +53,15 @@ struct MeshPeerList: View {
                             Image(systemName: "person.fill")
                                 .font(.bitchatSystem(size: 10))
                                 .foregroundColor(baseColor)
+                        } else if let radioName = peer.meshtastic {
+                            HStack {
+                                Image(systemName: "sensor.radiowaves.left.and.right")
+                                    .font(.bitchatSystem(size: 10))
+                                    .foregroundColor(baseColor)
+                                Text(radioName)
+                                    .font(.bitchatSystem(size: 10))
+                                    .foregroundColor(baseColor)
+                            }
                         } else if peer.isConnected {
                             // Mesh-connected peer: radio icon
                             Image(systemName: "antenna.radiowaves.left.and.right")

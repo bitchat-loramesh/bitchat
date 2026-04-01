@@ -8,6 +8,7 @@ final class GossipSyncManager {
         func sendPacket(to peerID: PeerID, packet: BitchatPacket)
         func signPacketForBroadcast(_ packet: BitchatPacket) -> BitchatPacket
         func getConnectedPeers() -> [PeerID]
+        func getNonMeshtasticConnectedPeers() -> [PeerID]
     }
 
     private struct PacketStore {
@@ -208,7 +209,7 @@ final class GossipSyncManager {
 
     private func sendPeriodicSync(for types: SyncTypeFlags) {
         // Unicast sync to connected peers to allow RSR attribution
-        if let connectedPeers = delegate?.getConnectedPeers(), !connectedPeers.isEmpty {
+        if let connectedPeers = delegate?.getNonMeshtasticConnectedPeers(), !connectedPeers.isEmpty {
             SecureLogger.debug("Sending periodic sync to \(connectedPeers.count) connected peers", category: .sync)
             for peerID in connectedPeers {
                 sendRequestSync(to: peerID, types: types)

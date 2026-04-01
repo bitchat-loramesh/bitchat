@@ -9,6 +9,7 @@ struct TransportPeerSnapshot: Equatable, Hashable {
     let isConnected: Bool
     let noisePublicKey: Data?
     let lastSeen: Date
+    let meshtastic: String?
 }
 
 protocol Transport: AnyObject {
