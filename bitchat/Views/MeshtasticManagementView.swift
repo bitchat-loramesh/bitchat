@@ -264,8 +264,6 @@ struct MeshtasticManagementView: View {
                         .foregroundColor(secondaryTextColor)
                         .padding(.top, 8)
                 } else {
-                    #if os(macOS)
-                    // Use ForEach instead of List for macOS to avoid rendering issues
                     ScrollView {
                         VStack(spacing: 8) {
                             ForEach(devices, id: \.1.identifier) { device in
@@ -275,12 +273,6 @@ struct MeshtasticManagementView: View {
                         .padding(.vertical, 4)
                     }
                     .frame(minHeight: 200)
-                    #else
-                    List(devices, id: \.1.identifier) { device in
-                        deviceRow(device: device, bleService: bleService)
-                    }
-                    .frame(minHeight: 200)
-                    #endif
                 }
             }
         }
